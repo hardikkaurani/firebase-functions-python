@@ -369,8 +369,13 @@ def normalize_timestamp_string(time: str) -> str:
     return f"{prefix}.{digits[:6]}{timezone}"
 
 
-def timestamp_conversion(time: str) -> _dt.datetime:
-    """Converts an ISO 8601 timestamp and returns a timezone-aware datetime object."""
+def timestamp_conversion(time: str | dict) -> _dt.datetime:
+    """Converts an ISO 8601 timestamp or dictionary and returns a timezone-aware datetime object."""
+    if isinstance(time, dict):
+        seconds = int(time.get("seconds", 0))
+        nanos = int(time.get("nanos", time.get("nanoseconds", 0)))
+        return _dt.datetime.fromtimestamp(seconds + (nanos / 1e9), tz=_dt.timezone.utc)
+
     normalized_time = normalize_timestamp_string(time)
     if "." not in normalized_time:
         return _dt.datetime.strptime(normalized_time, "%Y-%m-%dT%H:%M:%S%z")
