@@ -102,3 +102,43 @@ class TestFirestore(TestCase):
             decorated_func(raw_event)
 
             self.assertEqual(hello, "world")
+
+    def test_firestore_client_is_cached(self):
+        with patch.dict("sys.modules", mocked_modules):
+            from cloudevents.http import CloudEvent
+            from firebase_functions import firestore_fn
+
+            firestore_fn._firestore_clients.clear()
+            
+            func = Mock(__name__="example_func")
+            attributes = {
+                "specversion": "1.0",
+                "type": firestore_fn._event_type_created,
+                "source": "https://example.com/testevent",
+                "time": "2023-03-11T13:25:37.403Z",
+                "subject": "test_subject",
+                "datacontenttype": "application/json",
+                "location": "projects/project-id/databases/(default)/documents/foo/{bar}",
+                "project": "project-id",
+                "namespace": "(default)",
+                "document": "foo/{bar}",
+                "database": "projects/project-id/databases/(default)",
+                "authtype": "unauthenticated",
+                "authid": "foo",
+            }
+            raw_event = CloudEvent(attributes=attributes, data=json.dumps({}))
+            decorated_func = firestore_fn.on_document_created(document="/foo/{bar}")(func)
+
+            mock_client_cls = mocked_modules["google.cloud.firestore_v1"].Client
+            mock_client_cls.reset_mock()
+            
+            decorated_func(raw_event)
+            decorated_func(raw_event)
+            decorated_func(raw_event)
+
+            self.assertEqual(mock_client_cls.call_count, 1)
+            mock_client_cls.assert_called_with(
+                project=mocked_modules["firebase_admin"].get_app().project_id,
+                database="projects/project-id/databases/(default)",
+                credentials=mocked_modules["firebase_admin"].get_app().credential.get_credential()
+            )

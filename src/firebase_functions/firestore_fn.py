@@ -44,6 +44,8 @@ _event_type_created_with_auth_context = "google.cloud.firestore.document.v1.crea
 _event_type_updated_with_auth_context = "google.cloud.firestore.document.v1.updated.withAuthContext"
 _event_type_deleted_with_auth_context = "google.cloud.firestore.document.v1.deleted.withAuthContext"
 
+_firestore_clients: dict[tuple[str, str], _firestore_v1.Client] = {}
+
 
 @_dataclass.dataclass(frozen=True)
 class Event(_core.CloudEvent[_core.T]):
@@ -142,7 +144,16 @@ def _firestore_endpoint_handler(
     if _DEFAULT_APP_NAME not in _apps:
         initialize_app()
     app = get_app()
-    firestore_client = _firestore_v1.Client(project=app.project_id, database=event_database)
+
+    client_key = (app.project_id, event_database)
+    if client_key not in _firestore_clients:
+        _firestore_clients[client_key] = _firestore_v1.Client(
+            project=app.project_id,
+            database=event_database,
+            credentials=app.credential.get_credential(),
+        )
+    firestore_client = _firestore_clients[client_key]
+
     firestore_ref: DocumentReference = firestore_client.document(event_document)
     value_snapshot: DocumentSnapshot | None = None
     old_value_snapshot: DocumentSnapshot | None = None
