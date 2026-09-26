@@ -106,10 +106,11 @@ class TestFirestore(TestCase):
     def test_firestore_client_is_cached(self):
         with patch.dict("sys.modules", mocked_modules):
             from cloudevents.http import CloudEvent
+
             from firebase_functions import firestore_fn
 
             firestore_fn._firestore_clients.clear()
-            
+
             func = Mock(__name__="example_func")
             attributes = {
                 "specversion": "1.0",
@@ -131,7 +132,7 @@ class TestFirestore(TestCase):
 
             mock_client_cls = mocked_modules["google.cloud.firestore_v1"].Client
             mock_client_cls.reset_mock()
-            
+
             decorated_func(raw_event)
             decorated_func(raw_event)
             decorated_func(raw_event)
@@ -140,5 +141,190 @@ class TestFirestore(TestCase):
             mock_client_cls.assert_called_with(
                 project=mocked_modules["firebase_admin"].get_app().project_id,
                 database="projects/project-id/databases/(default)",
-                credentials=mocked_modules["firebase_admin"].get_app().credential.get_credential()
+                credentials=mocked_modules["firebase_admin"].get_app().credential.get_credential(),
+            )
+
+    def test_firestore_client_is_cached_concurrent(self):
+        with patch.dict("sys.modules", mocked_modules):
+            import threading
+
+            from cloudevents.http import CloudEvent
+
+            from firebase_functions import firestore_fn
+
+            firestore_fn._firestore_clients.clear()
+
+            func = Mock(__name__="example_func")
+            attributes = {
+                "specversion": "1.0",
+                "type": firestore_fn._event_type_created,
+                "source": "https://example.com/testevent",
+                "time": "2023-03-11T13:25:37.403Z",
+                "subject": "test_subject",
+                "datacontenttype": "application/json",
+                "location": "projects/project-id/databases/(default)/documents/foo/{bar}",
+                "project": "project-id",
+                "namespace": "(default)",
+                "document": "foo/{bar}",
+                "database": "projects/project-id/databases/(default)",
+                "authtype": "unauthenticated",
+                "authid": "foo",
+            }
+            raw_event = CloudEvent(attributes=attributes, data=json.dumps({}))
+            decorated_func = firestore_fn.on_document_created(document="/foo/{bar}")(func)
+
+            mock_client_cls = mocked_modules["google.cloud.firestore_v1"].Client
+            mock_client_cls.reset_mock()
+
+            app = mocked_modules["firebase_admin"].get_app()
+            get_cred_mock = app.credential.get_credential
+            get_cred_mock.reset_mock()
+
+            t1_in_critical_section = threading.Event()
+            t1_can_proceed = threading.Event()
+
+            t2_in_critical_section = threading.Event()
+            t2_can_proceed = threading.Event()
+
+            def get_credential_side_effect(*args, **kwargs):
+                if not t1_in_critical_section.is_set():
+                    t1_in_critical_section.set()
+                    t1_can_proceed.wait()
+                else:
+                    t2_in_critical_section.set()
+                    t2_can_proceed.wait()
+                return "mock_cred"
+
+            get_cred_mock.side_effect = get_credential_side_effect
+
+            def thread_task():
+                decorated_func(raw_event)
+
+            t1 = threading.Thread(target=thread_task)
+            t2 = threading.Thread(target=thread_task)
+
+            t1.start()
+            t1_in_critical_section.wait(timeout=5.0)
+
+            t2.start()
+            raced = t2_in_critical_section.wait(timeout=0.5)
+
+            t1_can_proceed.set()
+            t1.join()
+
+            t2_can_proceed.set()
+            t2.join()
+
+            get_cred_mock.side_effect = None
+
+            self.assertFalse(
+                raced,
+                "Race condition detected! Multiple threads entered initialization simultaneously.",
+            )
+            self.assertEqual(mock_client_cls.call_count, 1)
+
+    def test_firestore_client_cache_isolation(self):
+        with patch.dict("sys.modules", mocked_modules):
+            from cloudevents.http import CloudEvent
+
+            from firebase_functions import firestore_fn
+
+            firestore_fn._firestore_clients.clear()
+
+            func = Mock(__name__="example_func")
+
+            def create_event(project: str, database: str):
+                attributes = {
+                    "specversion": "1.0",
+                    "type": firestore_fn._event_type_created,
+                    "source": "https://example.com/testevent",
+                    "time": "2023-03-11T13:25:37.403Z",
+                    "subject": "test_subject",
+                    "datacontenttype": "application/json",
+                    "location": f"projects/{project}/databases/{database}/documents/foo/bar",
+                    "project": project,
+                    "namespace": "(default)",
+                    "document": "foo/bar",
+                    "database": f"projects/{project}/databases/{database}",
+                    "authtype": "unauthenticated",
+                    "authid": "foo",
+                }
+                return CloudEvent(attributes=attributes, data=json.dumps({}))
+
+            decorated_func = firestore_fn.on_document_created(document="/foo/{bar}")(func)
+
+            mock_client_cls = mocked_modules["google.cloud.firestore_v1"].Client
+            mock_client_cls.reset_mock()
+
+            app = mocked_modules["firebase_admin"].get_app()
+
+            # Project A, Database (default)
+            app.project_id = "project-A"
+            decorated_func(create_event("project-A", "(default)"))
+
+            # Project A, Database (default) -> Cached
+            decorated_func(create_event("project-A", "(default)"))
+
+            # Project B, Database (default) -> New client
+            app.project_id = "project-B"
+            decorated_func(create_event("project-B", "(default)"))
+
+            # Project A, Database other -> New client
+            app.project_id = "project-A"
+            decorated_func(create_event("project-A", "other"))
+
+            self.assertEqual(mock_client_cls.call_count, 3)
+
+    def test_firestore_client_creation_failure_does_not_poison_cache(self):
+        with patch.dict("sys.modules", mocked_modules):
+            from cloudevents.http import CloudEvent
+
+            from firebase_functions import firestore_fn
+
+            firestore_fn._firestore_clients.clear()
+
+            func = Mock(__name__="example_func")
+            attributes = {
+                "specversion": "1.0",
+                "type": firestore_fn._event_type_created,
+                "source": "https://example.com/testevent",
+                "time": "2023-03-11T13:25:37.403Z",
+                "subject": "test_subject",
+                "datacontenttype": "application/json",
+                "location": "projects/project-id/databases/(default)/documents/foo/bar",
+                "project": "project-id",
+                "namespace": "(default)",
+                "document": "foo/bar",
+                "database": "projects/project-id/databases/(default)",
+                "authtype": "unauthenticated",
+                "authid": "foo",
+            }
+            raw_event = CloudEvent(attributes=attributes, data=json.dumps({}))
+            decorated_func = firestore_fn.on_document_created(document="/foo/{bar}")(func)
+
+            mock_client_cls = mocked_modules["google.cloud.firestore_v1"].Client
+            app = mocked_modules["firebase_admin"].get_app()
+            app.project_id = "project-id"
+
+            class InitializationError(Exception):
+                pass
+
+            mock_client_cls.side_effect = InitializationError("Initialization failed")
+
+            with self.assertRaises(InitializationError, msg="Initialization failed"):
+                decorated_func(raw_event)
+
+            self.assertNotIn(
+                ("project-id", "projects/project-id/databases/(default)"),
+                firestore_fn._firestore_clients,
+            )
+
+            mock_client_cls.side_effect = None
+            mock_client_cls.return_value = MagicMock()
+
+            decorated_func(raw_event)
+
+            self.assertIn(
+                ("project-id", "projects/project-id/databases/(default)"),
+                firestore_fn._firestore_clients,
             )

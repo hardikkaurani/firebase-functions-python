@@ -18,6 +18,7 @@ Module for Cloud Functions that are triggered by Firestore.
 # pylint: disable=protected-access
 import dataclasses as _dataclass
 import functools as _functools
+import threading as _threading
 import typing as _typing
 
 import cloudevents.http as _ce
@@ -45,6 +46,7 @@ _event_type_updated_with_auth_context = "google.cloud.firestore.document.v1.upda
 _event_type_deleted_with_auth_context = "google.cloud.firestore.document.v1.deleted.withAuthContext"
 
 _firestore_clients: dict[tuple[str, str], _firestore_v1.Client] = {}
+_firestore_clients_lock = _threading.Lock()
 
 
 @_dataclass.dataclass(frozen=True)
@@ -147,11 +149,13 @@ def _firestore_endpoint_handler(
 
     client_key = (app.project_id, event_database)
     if client_key not in _firestore_clients:
-        _firestore_clients[client_key] = _firestore_v1.Client(
-            project=app.project_id,
-            database=event_database,
-            credentials=app.credential.get_credential(),
-        )
+        with _firestore_clients_lock:
+            if client_key not in _firestore_clients:
+                _firestore_clients[client_key] = _firestore_v1.Client(
+                    project=app.project_id,
+                    database=event_database,
+                    credentials=app.credential.get_credential(),
+                )
     firestore_client = _firestore_clients[client_key]
 
     firestore_ref: DocumentReference = firestore_client.document(event_document)
